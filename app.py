@@ -22,7 +22,7 @@ init_db()
 
 page = st.sidebar.selectbox(
     "功能导航",
-    ["📋 询价解析 & 报价", "📥 导入上游报价", "📄 生成合同", "📊 订单看板", "👥 客户档案"],
+    ["询价解析 & 报价", "导入上游报价", "生成合同", "订单看板", "客户档案"],
     label_visibility="collapsed"
 )
 
@@ -402,8 +402,8 @@ def _parse_upstream_excel(file_path: str) -> dict:
 # 页面 3：生成合同
 # ══════════════════════════════════════════════
 
-elif page == "📄 生成合同":
-    st.title("📄 合同生成")
+elif page == " 生成合同":
+    st.title(" 合同生成")
 
     has_prev = "quote_items" in st.session_state
     if has_prev:
