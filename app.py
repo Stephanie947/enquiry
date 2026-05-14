@@ -1,27 +1,28 @@
 import streamlit as st
 import pandas as pd
-import os
-import sys
-import tempfile
+import os, sys, tempfile
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from modules.db import init_db, generate_contract_no, save_order, get_all_orders, update_order_status, get_all_clients, save_client
+from modules.db import (init_db, generate_contract_no, save_order,
+                         get_all_orders, get_order_items, update_order,
+                         update_order_status, delete_order,
+                         get_all_clients, save_client, update_client, delete_client)
 from modules.parser import parse_excel, parse_image, parse_text, parse_pdf, apply_markup, flag_low_confidence
 from modules.excel_gen import gen_upstream_inquiry, gen_customer_quote
 from modules.contract_gen import gen_contract_pdf, amount_to_chinese
-from config import MARKUP_CONFIG, SUPPLIER_INFO
+from config import SUPPLIER_INFO
 
-st.set_page_config(page_title="QuoteFlow AI", page_icon="", layout="wide")
+st.set_page_config(page_title="QuoteFlow AI", layout="wide")
 init_db()
 
-# ── 辅助函数：解析上游Excel报价单 ──────────────
+# ── 解析上游Excel报价单（辅助函数）─────────────
 def parse_upstream_excel(file_path):
     df_raw = pd.read_excel(file_path, header=None)
     header_row = 0
     for i, row in df_raw.iterrows():
         row_str = " ".join(str(v).lower() for v in row.values)
-        if any(k in row_str for k in ["xing hao", "型号", "单价", "price", "货期"]):
+        if any(k in row_str for k in ["型号", "单价", "price", "货期", "含税"]):
             header_row = i
             break
     df = pd.read_excel(file_path, header=header_row)
@@ -35,8 +36,8 @@ def parse_upstream_excel(file_path):
         return None
 
     model_col    = find_col(["型号", "model", "part", "订货号"])
-    price_col    = find_col(["含税单价", "单价", "price", "unit price"])
-    delivery_col = find_col(["货期", "delivery", "lead time", "交期"])
+    price_col    = find_col(["含税单价", "单价", "price"])
+    delivery_col = find_col(["货期", "delivery", "交期"])
 
     results = {}
     for _, row in df.iterrows():
@@ -44,19 +45,18 @@ def parse_upstream_excel(file_path):
         if not model or model in ["nan", "合计", "小计", ""]:
             continue
         try:
-            price_str = str(row[price_col]).replace(",", "").replace("¥", "").replace("￥", "")
-            price = float(price_str) if price_col else 0.0
+            price = float(str(row[price_col]).replace(",","").replace("¥","").replace("￥","")) if price_col else 0.0
         except Exception:
             price = 0.0
-        delivery = str(row[delivery_col]).strip() if delivery_col and str(row.get(delivery_col, "")) != "nan" else ""
+        delivery = str(row[delivery_col]).strip() if delivery_col and str(row.get(delivery_col,"")) != "nan" else ""
         results[model] = {"purchase_price": price, "delivery_weeks": delivery}
     return results
 
 
-# ── 导航 ───────────────────────────────────────
+# ── 导航 ─────────────────────────────────────
 page = st.sidebar.selectbox(
     "功能导航",
-    ["询价解析", "导入上游报价", "生成合同", "订单看板", "客户档案"],
+    ["报价全流程", "生成合同", "订单看板", "客户档案"],
     label_visibility="collapsed"
 )
 st.sidebar.markdown("---")
@@ -65,29 +65,26 @@ st.sidebar.caption(f"联系人：{SUPPLIER_INFO['contact']}")
 
 
 # ══════════════════════════════════════════════
-# 页面1：询价解析 & 报价
+# 页面1：报价全流程（询价+上游报价合并）
 # ══════════════════════════════════════════════
-if page == "询价解析":
-    st.title("询价解析 & 报价生成")
+if page == "报价全流程":
+    st.title("报价全流程")
 
-    st.subheader("Step 1 | 上传询价单")
-    input_method = st.radio("询价单来源", ["Excel / PDF", "图片截图", "粘贴文字"], horizontal=True)
+    # ── Step 1：上传客户询价单 ─────────────────
+    st.subheader("Step 1 | 上传客户询价单")
+    input_method = st.radio("格式", ["Excel / PDF", "图片截图", "粘贴文字"], horizontal=True)
 
     items = []
 
     if input_method == "Excel / PDF":
-        uploaded = st.file_uploader("上传询价单", type=["xlsx", "xls", "pdf"])
+        uploaded = st.file_uploader("上传询价单", type=["xlsx","xls","pdf"], key="inq")
         if uploaded:
             suffix = ".pdf" if uploaded.name.lower().endswith(".pdf") else ".xlsx"
             with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                tmp.write(uploaded.read())
-                tmp_path = tmp.name
+                tmp.write(uploaded.read()); tmp_path = tmp.name
             try:
-                with st.spinner("正在解析..."):
-                    if suffix == ".pdf":
-                        items = parse_pdf(tmp_path, mode="inquiry")
-                    else:
-                        items = parse_excel(tmp_path)
+                with st.spinner("解析中..."):
+                    items = parse_pdf(tmp_path, mode="inquiry") if suffix==".pdf" else parse_excel(tmp_path)
                     items = flag_low_confidence(items)
                 st.success(f"识别到 {len(items)} 条产品")
                 st.session_state["parsed_items"] = items
@@ -97,15 +94,14 @@ if page == "询价解析":
                 os.unlink(tmp_path)
 
     elif input_method == "图片截图":
-        uploaded = st.file_uploader("上传图片", type=["png", "jpg", "jpeg"])
+        uploaded = st.file_uploader("上传图片", type=["png","jpg","jpeg"], key="img")
         if uploaded:
             st.image(uploaded, width=500)
-            img_bytes = uploaded.getvalue()
-            mime = "image/png" if uploaded.name.endswith(".png") else "image/jpeg"
             if st.button("AI识别图片", type="primary"):
-                with st.spinner("Gemini Vision 正在识别..."):
+                with st.spinner("识别中..."):
                     try:
-                        items = parse_image(img_bytes, mime)
+                        items = parse_image(uploaded.getvalue(),
+                                            "image/png" if uploaded.name.endswith(".png") else "image/jpeg")
                         items = flag_low_confidence(items)
                         st.session_state["parsed_items"] = items
                         st.success(f"识别到 {len(items)} 条产品")
@@ -113,11 +109,11 @@ if page == "询价解析":
                         st.error(f"识别失败：{e}")
 
     elif input_method == "粘贴文字":
-        raw_text = st.text_area("粘贴询价内容", height=200)
-        if st.button("AI解析", type="primary") and raw_text:
+        raw = st.text_area("粘贴询价内容", height=180)
+        if st.button("AI解析", type="primary") and raw:
             with st.spinner("解析中..."):
                 try:
-                    items = parse_text(raw_text)
+                    items = parse_text(raw)
                     items = flag_low_confidence(items)
                     st.session_state["parsed_items"] = items
                     st.success(f"解析到 {len(items)} 条产品")
@@ -127,236 +123,165 @@ if page == "询价解析":
     if not items and "parsed_items" in st.session_state:
         items = st.session_state["parsed_items"]
 
-    if items:
-        st.markdown("---")
-        st.subheader("Step 2 | 核对产品明细")
-
-        needs_review = [i for i in items if i.get("needs_review")]
-        if needs_review:
-            st.warning(f"{len(needs_review)} 条置信度偏低，请人工确认")
-
-        df = pd.DataFrame([{
-            "完整型号": i.get("model_full", ""),
-            "订货号":   i.get("model_short", ""),
-            "产品描述": i.get("description", ""),
-            "数量":     i.get("qty", 0),
-            "单位":     i.get("unit", "个"),
-            "品牌":     i.get("brand", "BALLUFF"),
-            "状态":     "需确认" if i.get("needs_review") else "正常",
-        } for i in items])
-
-        edited_df = st.data_editor(df, use_container_width=True, num_rows="dynamic")
-
-        for idx, row in edited_df.iterrows():
-            if idx < len(items):
-                items[idx]["model_full"]  = row["完整型号"]
-                items[idx]["model_short"] = row["订货号"]
-                items[idx]["description"] = row["产品描述"]
-                items[idx]["qty"]   = int(row["数量"]) if str(row["数量"]).isdigit() else items[idx]["qty"]
-                items[idx]["unit"]  = row["单位"]
-                items[idx]["brand"] = row["品牌"]
-
-        st.session_state["confirmed_items"] = items
-
-        st.markdown("---")
-        st.subheader("Step 3 | 生成上游询价单")
-        brand = st.text_input("品牌", value=items[0].get("brand", "BALLUFF") if items else "BALLUFF")
-        if st.button("生成询价Excel"):
-            path = gen_upstream_inquiry(items, brand)
-            with open(path, "rb") as f:
-                st.download_button("下载询价单", f.read(),
-                    file_name=os.path.basename(path),
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            st.info("发给厂商后，收到报价请前往「导入上游报价」页面")
-
-        st.markdown("---")
-        st.subheader("Step 4 | 录入进价 -> 生成客户报价单")
-
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            client_name = st.text_input("客户名称", placeholder="如：上海科致电气自动化股份有限公司")
-        with col2:
-            markup_rate = st.number_input("默认加价率", min_value=1.0, max_value=3.0, value=1.30, step=0.05)
-
-        imported_prices  = st.session_state.get("imported_prices", {})
-        imported_markups = st.session_state.get("imported_markups", {})
-
-        if imported_prices:
-            st.success(f"已从上游报价单导入 {len(imported_prices)} 条进价")
-
-        cols_h = st.columns([3, 2, 2, 1])
-        cols_h[0].markdown("**型号**")
-        cols_h[1].markdown("**含税进价**")
-        cols_h[2].markdown("**货期**")
-        cols_h[3].markdown("**系数**")
-
-        for i, item in enumerate(items):
-            model_key = item.get("model_short") or item.get("model_full", "")
-            col_m, col_p, col_d, col_r = st.columns([3, 2, 2, 1])
-            col_m.text(model_key[:25])
-
-            default_price    = imported_prices.get(model_key, {}).get("purchase_price", 0.0)
-            default_delivery = imported_prices.get(model_key, {}).get("delivery_weeks", "")
-            default_markup   = imported_markups.get(model_key, markup_rate)
-
-            price = col_p.number_input(
-                f"p{i}", min_value=0.0, step=1.0, value=float(default_price),
-                key=f"price_{i}", label_visibility="collapsed")
-            delivery = col_d.text_input(
-                f"d{i}", value=default_delivery, key=f"delivery_{i}",
-                label_visibility="collapsed", placeholder="如：4周")
-            sku_markup = col_r.number_input(
-                f"m{i}", min_value=1.0, max_value=3.0, value=float(default_markup),
-                step=0.05, key=f"markup_{i}", label_visibility="collapsed")
-
-            items[i]["purchase_price"]  = price
-            items[i]["delivery_weeks"]  = delivery
-            items[i]["sku_markup_rate"] = sku_markup
-
-        for item in items:
-            purchase = item.get("purchase_price", 0.0)
-            rate = item.get("sku_markup_rate", markup_rate)
-            if purchase > 0:
-                sale = round(purchase * rate, 2)
-                item["sale_price"]  = sale
-                item["total_price"] = round(sale * item.get("qty", 0), 2)
-            else:
-                item["sale_price"]  = 0.0
-                item["total_price"] = 0.0
-
-        filled = [i for i in items if i.get("purchase_price", 0) > 0]
-        if filled:
-            total  = sum(i.get("total_price", 0) for i in filled)
-            cost   = sum(i.get("purchase_price", 0) * i.get("qty", 0) for i in filled)
-            profit = total - cost
-            c1, c2, c3 = st.columns(3)
-            c1.metric("含税报价总额", f"¥{total:,.2f}")
-            c2.metric("预计毛利",     f"¥{profit:,.2f}")
-            c3.metric("毛利率",       f"{profit/total*100:.1f}%" if total else "—")
-
-        if st.button("生成客户报价单", type="primary"):
-            if not client_name:
-                st.error("请填写客户名称")
-            else:
-                path = gen_customer_quote(items, client_name, markup_rate)
-                st.session_state["quote_items"]  = items
-                st.session_state["quote_client"] = client_name
-                with open(path, "rb") as f:
-                    st.download_button("下载客户报价单", f.read(),
-                        file_name=os.path.basename(path),
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-                st.success("报价单已生成！客户确认后前往「生成合同」页面")
-
-
-# ══════════════════════════════════════════════
-# 页面2：导入上游报价
-# ══════════════════════════════════════════════
-elif page == "导入上游报价":
-    st.title("导入上游厂商报价单")
-    st.caption("上传厂商报价单，自动匹配进价，支持每个SKU单独设置加价系数")
-
-    confirmed_items = st.session_state.get("confirmed_items", [])
-    if not confirmed_items:
-        st.warning("请先在「询价解析」页面完成询价单解析")
+    if not items:
         st.stop()
 
-    st.info(f"当前询价单共 {len(confirmed_items)} 个SKU")
+    # ── Step 2：核对明细 ───────────────────────
+    st.markdown("---")
+    st.subheader("Step 2 | 核对产品明细")
 
-    st.subheader("Step 1 | 上传厂商报价单")
-    uploaded = st.file_uploader("支持Excel或PDF格式", type=["xlsx", "xls", "pdf"], key="upstream_upload")
+    if any(i.get("needs_review") for i in items):
+        st.warning(f"{sum(1 for i in items if i.get('needs_review'))} 条置信度偏低，请确认")
 
-    quote_data = {}
+    edited_df = st.data_editor(pd.DataFrame([{
+        "完整型号": i.get("model_full",""),
+        "订货号":   i.get("model_short",""),
+        "描述":     i.get("description",""),
+        "数量":     i.get("qty",0),
+        "单位":     i.get("unit","只"),
+        "品牌":     i.get("brand","BALLUFF"),
+        "状态":     "需确认" if i.get("needs_review") else "正常",
+    } for i in items]), use_container_width=True, num_rows="dynamic")
 
-    if uploaded:
-        suffix = ".pdf" if uploaded.name.lower().endswith(".pdf") else ".xlsx"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(uploaded.read())
-            tmp_path = tmp.name
+    for idx, row in edited_df.iterrows():
+        if idx < len(items):
+            items[idx].update({
+                "model_full": row["完整型号"], "model_short": row["订货号"],
+                "description": row["描述"],
+                "qty": int(row["数量"]) if str(row["数量"]).isdigit() else items[idx]["qty"],
+                "unit": row["单位"], "brand": row["品牌"],
+            })
+    st.session_state["confirmed_items"] = items
+
+    # ── Step 3：生成上游询价单 ─────────────────
+    st.markdown("---")
+    st.subheader("Step 3 | 生成上游询价单（发给厂商）")
+    col_a, col_b = st.columns([3,1])
+    brand = col_a.text_input("品牌", value=items[0].get("brand","BALLUFF"))
+    if col_b.button("生成并下载", key="gen_inq"):
+        path = gen_upstream_inquiry(items, brand)
+        with open(path,"rb") as f:
+            st.download_button("下载询价Excel", f.read(),
+                file_name=os.path.basename(path),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    # ── Step 4：导入厂商报价（同页面）─────────
+    st.markdown("---")
+    st.subheader("Step 4 | 导入厂商报价单（收到回复后操作）")
+
+    up2 = st.file_uploader("上传厂商报价单（Excel或PDF）", type=["xlsx","xls","pdf"], key="upstream")
+    quote_data = st.session_state.get("quote_data", {})
+
+    if up2:
+        suffix2 = ".pdf" if up2.name.lower().endswith(".pdf") else ".xlsx"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix2) as tmp2:
+            tmp2.write(up2.read()); tmp2_path = tmp2.name
         try:
-            with st.spinner("正在解析厂商报价单..."):
-                if suffix == ".pdf":
-                    quote_data = parse_pdf(tmp_path, mode="quote")
-                else:
-                    quote_data = parse_upstream_excel(tmp_path)
-            st.success(f"从厂商报价单解析到 {len(quote_data)} 条价格")
+            with st.spinner("解析厂商报价..."):
+                quote_data = parse_pdf(tmp2_path, mode="quote") if suffix2==".pdf" else parse_upstream_excel(tmp2_path)
+            st.session_state["quote_data"] = quote_data
+            st.success(f"解析到 {len(quote_data)} 条厂商报价")
         except Exception as e:
             st.error(f"解析失败：{e}")
         finally:
-            os.unlink(tmp_path)
+            os.unlink(tmp2_path)
 
-    st.subheader("Step 2 | 匹配进价 & 设置SKU加价系数")
-    default_markup = st.number_input("默认系数", min_value=1.0, max_value=3.0, value=1.30, step=0.05)
+    # ── Step 5：设置加价系数，预览报价 ────────
+    st.markdown("---")
+    st.subheader("Step 5 | 设置加价系数 & 确认报价")
 
-    rows = []
-    for item in confirmed_items:
-        model_key   = item.get("model_short") or item.get("model_full", "")
-        matched     = quote_data.get(model_key, {})
-        purchase    = matched.get("purchase_price", 0.0)
-        delivery    = matched.get("delivery_weeks", "")
-        rows.append({
-            "型号":     model_key,
-            "数量":     item.get("qty", 0),
-            "含税进价": purchase,
-            "货期":     delivery,
-            "加价系数": default_markup,
-            "匹配状态": "已匹配" if purchase > 0 else "未匹配",
-        })
+    col1, col2, col3 = st.columns([2,1,1])
+    client_name  = col1.text_input("客户名称", placeholder="如：上海科致电气自动化股份有限公司")
+    markup_rate  = col2.number_input("默认加价率", min_value=1.0, max_value=3.0, value=1.30, step=0.05)
 
-    edit_df = pd.DataFrame(rows)
-    edited = st.data_editor(
-        edit_df, use_container_width=True,
-        column_config={
-            "含税进价": st.column_config.NumberColumn("含税进价（元）", min_value=0.0, step=1.0),
-            "加价系数": st.column_config.NumberColumn("加价系数", min_value=1.0, max_value=3.0, step=0.05),
-            "匹配状态": st.column_config.TextColumn("匹配状态", disabled=True),
-        },
-        num_rows="fixed"
-    )
+    imported_prices  = st.session_state.get("imported_prices", {})
+    imported_markups = st.session_state.get("imported_markups", {})
 
-    if not edited.empty:
-        total_cost   = sum(edited["含税进价"] * edit_df["数量"])
-        total_sale   = sum(edited["含税进价"] * edited["加价系数"] * edit_df["数量"])
-        total_profit = total_sale - total_cost
-        unmatched    = len(edited[edited["含税进价"] == 0])
+    # 自动从quote_data填入进价
+    if quote_data and not imported_prices:
+        for item in items:
+            mk = item.get("model_short") or item.get("model_full","")
+            if mk in quote_data:
+                imported_prices[mk]  = quote_data[mk]
+                imported_markups[mk] = markup_rate
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("含税报价总额", f"¥{total_sale:,.2f}")
-        c2.metric("预计毛利",     f"¥{total_profit:,.2f}")
-        c3.metric("毛利率",       f"{total_profit/total_sale*100:.1f}%" if total_sale else "—")
-        c4.metric("未匹配SKU",   f"{unmatched} 个")
+    cols_h = st.columns([3,2,2,1])
+    cols_h[0].markdown("**型号**"); cols_h[1].markdown("**含税进价**")
+    cols_h[2].markdown("**货期**"); cols_h[3].markdown("**系数**")
 
-    if st.button("确认导入，同步到报价页面", type="primary"):
-        imported_prices  = {}
-        imported_markups = {}
-        for _, row in edited.iterrows():
-            model_key = row["型号"]
-            imported_prices[model_key]  = {
-                "purchase_price": float(row["含税进价"]),
-                "delivery_weeks": str(row["货期"]),
-            }
-            imported_markups[model_key] = float(row["加价系数"])
+    for i, item in enumerate(items):
+        mk = item.get("model_short") or item.get("model_full","")
+        cm1, cm2, cm3, cm4 = st.columns([3,2,2,1])
+        cm1.text(mk[:28])
+        default_p = imported_prices.get(mk, {}).get("purchase_price", 0.0)
+        default_d = imported_prices.get(mk, {}).get("delivery_weeks", "")
+        default_m = imported_markups.get(mk, markup_rate)
 
-        st.session_state["imported_prices"]  = imported_prices
-        st.session_state["imported_markups"] = imported_markups
-        st.success("已同步！回到「询价解析」页面，进价和系数已自动填入")
-        st.balloons()
+        price    = cm2.number_input(f"p{i}", min_value=0.0, step=1.0, value=float(default_p),
+                                    key=f"price_{i}", label_visibility="collapsed")
+        delivery = cm3.text_input(f"d{i}", value=default_d, key=f"delivery_{i}",
+                                   label_visibility="collapsed", placeholder="如：现货/4周")
+        sku_rate = cm4.number_input(f"r{i}", min_value=1.0, max_value=3.0, value=float(default_m),
+                                    step=0.05, key=f"rate_{i}", label_visibility="collapsed")
+        items[i].update({"purchase_price": price, "delivery_weeks": delivery, "sku_markup_rate": sku_rate})
+
+    # 计算报价
+    for item in items:
+        p = item.get("purchase_price", 0.0)
+        r = item.get("sku_markup_rate", markup_rate)
+        if p > 0:
+            s = round(p * r, 2)
+            item["sale_price"]  = s
+            item["total_price"] = round(s * item.get("qty",0), 2)
+        else:
+            item["sale_price"] = item["total_price"] = 0.0
+
+    filled = [i for i in items if i.get("purchase_price",0) > 0]
+    if filled:
+        total  = sum(i["total_price"] for i in filled)
+        cost   = sum(i["purchase_price"] * i["qty"] for i in filled)
+        profit = total - cost
+        c1,c2,c3 = st.columns(3)
+        c1.metric("含税报价总额", f"¥{total:,.2f}")
+        c2.metric("预计毛利",     f"¥{profit:,.2f}")
+        c3.metric("毛利率",       f"{profit/total*100:.1f}%" if total else "—")
+
+    col_x, col_y = st.columns(2)
+    if col_x.button("生成客户报价Excel", type="primary"):
+        if not client_name:
+            st.error("请填写客户名称")
+        else:
+            path = gen_customer_quote(items, client_name, markup_rate)
+            st.session_state["quote_items"]  = items
+            st.session_state["quote_client"] = client_name
+            with open(path,"rb") as f:
+                st.download_button("下载报价单", f.read(),
+                    file_name=os.path.basename(path),
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            st.success("报价单生成！客户确认后前往「生成合同」")
+
+    if col_y.button("客户已确认，直接去生成合同"):
+        if not client_name:
+            st.error("请填写客户名称")
+        else:
+            st.session_state["quote_items"]  = items
+            st.session_state["quote_client"] = client_name
+            st.success("已保存，请点击左侧「生成合同」")
 
 
 # ══════════════════════════════════════════════
-# 页面3：生成合同
+# 页面2：生成合同
 # ══════════════════════════════════════════════
 elif page == "生成合同":
-    st.title("合同生成")
+    st.title("生成合同")
 
-    has_prev = "quote_items" in st.session_state
-    if has_prev:
-        items = st.session_state["quote_items"]
-        default_client = st.session_state.get("quote_client", "")
+    items          = st.session_state.get("quote_items", [])
+    default_client = st.session_state.get("quote_client", "")
+
+    if items:
         st.success(f"已读取报价：{default_client}，{len(items)} 条产品")
     else:
-        st.info("请先在询价解析页面完成报价")
-        items = []
-        default_client = ""
+        st.info("请先在「报价全流程」页面完成报价")
 
     st.subheader("客户信息")
     clients      = get_all_clients()
@@ -364,118 +289,148 @@ elif page == "生成合同":
     selected     = st.selectbox("选择客户", ["手动输入..."] + client_names)
 
     if selected == "手动输入...":
-        c1, c2 = st.columns(2)
-        client_name    = c1.text_input("客户名称", value=default_client)
-        client_address = c2.text_input("地址")
-        c3, c4 = st.columns(2)
-        client_bank    = c3.text_input("开户银行")
-        client_account = c4.text_input("账号")
-        c5, c6 = st.columns(2)
-        client_tax     = c5.text_input("税号")
-        client_phone   = c6.text_input("电话")
-        client_info = {"name": client_name, "address": client_address,
-                       "bank": client_bank, "account": client_account,
-                       "tax_no": client_tax, "phone": client_phone, "contact": ""}
+        c1,c2 = st.columns(2)
+        cn  = c1.text_input("客户名称", value=default_client)
+        ca  = c2.text_input("地址")
+        c3,c4 = st.columns(2)
+        cb  = c3.text_input("开户银行")
+        cac = c4.text_input("账号")
+        c5,c6 = st.columns(2)
+        ct  = c5.text_input("税号")
+        cp  = c6.text_input("电话")
+        cc  = st.text_input("委托代理人")
+        client_info = {"name":cn,"address":ca,"bank":cb,"account":cac,
+                       "tax_no":ct,"phone":cp,"contact":cc}
         if st.button("保存客户档案"):
-            save_client(client_name, client_address, client_bank, client_account, client_tax, "", client_phone)
+            save_client(cn,ca,cb,cac,ct,cc,cp)
             st.success("已保存")
     else:
-        client_info = dict(next(c for c in clients if c["name"] == selected))
+        client_info = dict(next(c for c in clients if c["name"]==selected))
         st.json(client_info, expanded=False)
 
     st.subheader("合同参数")
-    c1, c2 = st.columns(2)
+    c1,c2 = st.columns(2)
     contract_no = c1.text_input("合同编号", value=generate_contract_no())
     sign_date   = c2.text_input("签订日期（空则自动填今天）", value="")
 
-    payment_options = {
-        "30%预付+余款到发货": "合同签订时需方支付30%预付，余款款到发货",
+    payment_opts = {
         "款到发货":           "款到发货",
-        "月结30天":           "月结30天，发票开具后30天内付款",
+        "现货款到发货":       "现货 款到发货",
+        "30%预付+余款到发货": "合同签订后需方支付30%预付，余款款到发货",
         "自定义":             ""
     }
-    pay_choice    = st.selectbox("付款方式", list(payment_options.keys()))
-    payment_terms = st.text_area("自定义条款", height=60) if pay_choice == "自定义" else payment_options[pay_choice]
+    pay_choice    = st.selectbox("付款方式", list(payment_opts.keys()))
+    payment_terms = st.text_area("自定义", height=50) if pay_choice=="自定义" else payment_opts[pay_choice]
 
     if items:
-        total = sum(i.get("sale_price", 0) * i.get("qty", 0) for i in items)
-        st.subheader("产品明细")
+        total = sum(i.get("sale_price",0)*i.get("qty",0) for i in items)
+        st.subheader("产品明细预览")
         st.dataframe(pd.DataFrame([{
-            "型号":     i.get("model_short") or i.get("model_full", ""),
-            "制造商":   i.get("brand", "巴鲁夫"),
-            "数量":     i.get("qty", 0),
-            "含税单价": i.get("sale_price", 0),
-            "总价":     round(i.get("sale_price", 0) * i.get("qty", 0), 2),
-            "货期":     i.get("delivery_weeks", ""),
+            "型号":     i.get("model_short") or i.get("model_full",""),
+            "单位":     i.get("unit","只"),
+            "数量":     i.get("qty",0),
+            "含税单价": i.get("sale_price",0),
+            "总价":     round(i.get("sale_price",0)*i.get("qty",0),2),
+            "货期":     i.get("delivery_weeks",""),
         } for i in items]), use_container_width=True)
         st.markdown(f"**含税合计：¥{total:,.2f}（{amount_to_chinese(total)}）**")
 
     if st.button("生成PDF合同", type="primary"):
         if not items:
-            st.error("无产品数据，请先完成报价流程")
+            st.error("请先完成报价")
         elif not client_info.get("name"):
             st.error("请填写客户名称")
         else:
             with st.spinner("生成中..."):
                 try:
-                    path = gen_contract_pdf(contract_no=contract_no, client_info=client_info,
-                                            items=items, payment_terms=payment_terms,
-                                            sign_date=sign_date or None)
+                    path = gen_contract_pdf(contract_no, client_info, items,
+                                            payment_terms, sign_date or None)
                     save_order(contract_no, client_info["name"], items, 1.3, notes=payment_terms)
-                    with open(path, "rb") as f:
+                    with open(path,"rb") as f:
                         st.download_button("下载合同PDF", f.read(),
                             file_name=os.path.basename(path), mime="application/pdf")
-                    st.success("合同生成，订单已录入看板")
+                    st.success("合同已生成，订单已录入看板")
                 except Exception as e:
-                    st.error(f"失败：{e}")
-                    st.exception(e)
+                    st.error(f"失败：{e}"); st.exception(e)
 
 
 # ══════════════════════════════════════════════
-# 页面4：订单看板
+# 页面3：订单看板（支持编辑删除）
 # ══════════════════════════════════════════════
 elif page == "订单看板":
     st.title("订单看板")
     orders = get_all_orders()
 
     if not orders:
-        st.info("暂无订单，完成报价并生成合同后自动录入")
+        st.info("暂无订单")
     else:
         import datetime
         month        = datetime.datetime.now().strftime("%Y-%m")
         month_orders = [o for o in orders if o["created_at"].startswith(month)]
         pending      = [o for o in orders if o["status"] not in ["回款完成"]]
 
-        c1, c2, c3, c4 = st.columns(4)
+        c1,c2,c3,c4 = st.columns(4)
         c1.metric("总订单数", len(orders))
         c2.metric("本月新增", len(month_orders))
         c3.metric("本月金额", f"¥{sum(o['total_amount'] or 0 for o in month_orders):,.0f}")
         c4.metric("待回款",   f"¥{sum(o['total_amount'] or 0 for o in pending):,.0f}")
 
         st.markdown("---")
-        STATUS_LIST   = ["询价中", "已报价", "合同签订", "采购备货", "已发货", "回款完成"]
-        status_filter = st.selectbox("筛选", ["全部"] + STATUS_LIST)
-        filtered = orders if status_filter == "全部" else [o for o in orders if o["status"] == status_filter]
+        STATUS_LIST   = ["询价中","已报价","合同签订","采购备货","已发货","回款完成"]
+        status_filter = st.selectbox("筛选状态", ["全部"]+STATUS_LIST)
+        filtered = orders if status_filter=="全部" else [o for o in orders if o["status"]==status_filter]
 
         for order in filtered:
+            oid = order["id"]
             with st.expander(f"{order['contract_no']} | {order['client_name']} | ¥{order['total_amount']:,.2f} | {order['status']}"):
-                col1, col2 = st.columns([3, 1])
-                with col1:
+                tab1, tab2 = st.tabs(["查看 / 状态", "编辑 / 删除"])
+
+                with tab1:
                     st.write(f"**客户：** {order['client_name']}")
-                    st.write(f"**时间：** {order['created_at']}")
+                    st.write(f"**合同号：** {order['contract_no']}")
+                    st.write(f"**金额：** ¥{order['total_amount']:,.2f}")
+                    st.write(f"**创建：** {order['created_at']}")
                     if order["notes"]:
                         st.write(f"**付款：** {order['notes']}")
-                with col2:
-                    new_status = st.selectbox("状态", STATUS_LIST,
+                    new_status = st.selectbox("更新状态", STATUS_LIST,
                         index=STATUS_LIST.index(order["status"]) if order["status"] in STATUS_LIST else 0,
-                        key=f"s_{order['id']}")
-                    if st.button("更新", key=f"u_{order['id']}"):
-                        update_order_status(order["id"], new_status)
+                        key=f"st_{oid}")
+                    if st.button("更新状态", key=f"upd_{oid}"):
+                        update_order_status(oid, new_status)
                         st.rerun()
+
+                with tab2:
+                    e_contract = st.text_input("合同编号", value=order["contract_no"], key=f"ec_{oid}")
+                    e_client   = st.text_input("客户名称", value=order["client_name"],  key=f"ecl_{oid}")
+                    e_amount   = st.number_input("金额", value=float(order["total_amount"] or 0), key=f"ea_{oid}")
+                    e_notes    = st.text_input("备注", value=order["notes"] or "", key=f"en_{oid}")
+                    e_status   = st.selectbox("状态", STATUS_LIST,
+                        index=STATUS_LIST.index(order["status"]) if order["status"] in STATUS_LIST else 0,
+                        key=f"es_{oid}")
+
+                    col_save, col_del = st.columns(2)
+                    if col_save.button("保存修改", key=f"save_{oid}"):
+                        update_order(oid, e_contract, e_client, e_amount, e_status, e_notes)
+                        st.success("已保存")
+                        st.rerun()
+
+                    if col_del.button("删除此订单", key=f"del_{oid}", type="primary"):
+                        st.session_state[f"confirm_del_{oid}"] = True
+
+                    if st.session_state.get(f"confirm_del_{oid}"):
+                        st.warning("确认删除？此操作不可恢复")
+                        cc1, cc2 = st.columns(2)
+                        if cc1.button("确认删除", key=f"yes_{oid}"):
+                            delete_order(oid)
+                            st.success("已删除")
+                            st.rerun()
+                        if cc2.button("取消", key=f"no_{oid}"):
+                            st.session_state[f"confirm_del_{oid}"] = False
+                            st.rerun()
 
 
 # ══════════════════════════════════════════════
-# 页面5：客户档案
+# 页面4：客户档案（支持编辑删除）
 # ══════════════════════════════════════════════
 elif page == "客户档案":
     st.title("客户档案")
@@ -483,13 +438,13 @@ elif page == "客户档案":
 
     with st.form("add_client"):
         st.subheader("新增客户")
-        c1, c2  = st.columns(2)
+        c1,c2   = st.columns(2)
         name    = c1.text_input("客户名称 *")
-        contact = c2.text_input("联系人")
-        c3, c4  = st.columns(2)
+        contact = c2.text_input("委托代理人")
+        c3,c4   = st.columns(2)
         phone   = c3.text_input("电话")
         address = c4.text_input("地址")
-        c5, c6  = st.columns(2)
+        c5,c6   = st.columns(2)
         bank    = c5.text_input("开户银行")
         account = c6.text_input("账号")
         tax_no  = st.text_input("税号")
@@ -500,9 +455,44 @@ elif page == "客户档案":
 
     st.markdown("---")
     st.subheader(f"已有客户（{len(clients)}）")
-    if clients:
-        st.dataframe(
-            pd.DataFrame(clients)[["name", "contact", "phone", "address", "tax_no"]].rename(
-                columns={"name": "名称", "contact": "联系人", "phone": "电话",
-                         "address": "地址", "tax_no": "税号"}),
-            use_container_width=True)
+
+    for client in clients:
+        cid = client["id"]
+        with st.expander(f"{client['name']} | {client.get('phone','')}"):
+            tab1, tab2 = st.tabs(["查看", "编辑 / 删除"])
+
+            with tab1:
+                st.write(f"**名称：** {client['name']}")
+                st.write(f"**地址：** {client.get('address','')}")
+                st.write(f"**联系人：** {client.get('contact','')}  电话：{client.get('phone','')}")
+                st.write(f"**开户银行：** {client.get('bank','')}  账号：{client.get('account','')}")
+                st.write(f"**税号：** {client.get('tax_no','')}")
+
+            with tab2:
+                e_name    = st.text_input("名称",   value=client["name"],              key=f"cn_{cid}")
+                e_addr    = st.text_input("地址",   value=client.get("address",""),    key=f"ca_{cid}")
+                e_contact = st.text_input("联系人", value=client.get("contact",""),    key=f"cc_{cid}")
+                e_phone   = st.text_input("电话",   value=client.get("phone",""),      key=f"cp_{cid}")
+                e_bank    = st.text_input("开户银行", value=client.get("bank",""),     key=f"cb_{cid}")
+                e_account = st.text_input("账号",   value=client.get("account",""),    key=f"cac_{cid}")
+                e_tax     = st.text_input("税号",   value=client.get("tax_no",""),     key=f"ct_{cid}")
+
+                col_s, col_d = st.columns(2)
+                if col_s.button("保存修改", key=f"csave_{cid}"):
+                    update_client(cid, e_name, e_addr, e_bank, e_account, e_tax, e_contact, e_phone)
+                    st.success("已保存")
+                    st.rerun()
+
+                if col_d.button("删除客户", key=f"cdel_{cid}", type="primary"):
+                    st.session_state[f"confirm_cdel_{cid}"] = True
+
+                if st.session_state.get(f"confirm_cdel_{cid}"):
+                    st.warning("确认删除？")
+                    cd1, cd2 = st.columns(2)
+                    if cd1.button("确认", key=f"cyes_{cid}"):
+                        delete_client(cid)
+                        st.success("已删除")
+                        st.rerun()
+                    if cd2.button("取消", key=f"cno_{cid}"):
+                        st.session_state[f"confirm_cdel_{cid}"] = False
+                        st.rerun()
