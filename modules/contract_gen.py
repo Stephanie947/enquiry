@@ -76,11 +76,29 @@ def amount_to_chinese(amount: float) -> str:
 
 
 def _register_fonts():
+    """
+    注册中文字体，优先级：
+    1. reportlab 内置 CID 字体 STSong-Light（零依赖，不需要系统字体文件，Streamlit Cloud 可用）
+    2. 系统 TTF 字体（wqy-zenhei 等，本地开发时回退）
+
+    旧版只找系统路径，Streamlit Cloud Linux 环境路径不同时找不到字体 → 黑块
+    新版改为优先用 CID 字体，完全绕开系统字体依赖
+    """
+    # 方案1：reportlab 内置 CID 宋体（推荐，无需任何字体文件）
+    try:
+        from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+        pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
+        return "STSong-Light"
+    except Exception:
+        pass
+
+    # 方案2：系统 TTF 字体（兜底）
     candidates = [
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
         "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
-        "/usr/share/fonts/truetype/arphic/uming.ttc",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
         "/System/Library/Fonts/PingFang.ttc",
+        os.path.join(os.path.dirname(__file__), "..", "wqy-zenhei.ttc"),
     ]
     for path in candidates:
         if os.path.exists(path):
@@ -89,7 +107,8 @@ def _register_fonts():
                 return "CN"
             except Exception:
                 continue
-    return "Helvetica"
+
+    return "Helvetica"  # 最终兜底（中文会乱码，但不会崩溃）
 
 
 def gen_contract_pdf(contract_no, client_info, items, payment_terms="款到发货", sign_date=None):

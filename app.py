@@ -18,37 +18,69 @@ init_db()
 
 # ── 解析上游Excel报价单（辅助函数）─────────────
 def parse_upstream_excel(file_path):
-    df_raw = pd.read_excel(file_path, header=None)
-    header_row = 0
-    for i, row in df_raw.iterrows():
-        row_str = " ".join(str(v).lower() for v in row.values)
-        if any(k in row_str for k in ["型号", "单价", "price", "货期", "含税"]):
-            header_row = i
-            break
-    df = pd.read_excel(file_path, header=header_row)
-    df.columns = [str(c).strip() for c in df.columns]
+    """
+    解析厂商回传的报价Excel，返回 {型号: {"purchase_price": float, "delivery_weeks": str}}
 
-    def find_col(candidates):
+    修复说明（v2）：
+    - 旧版用 pd.read_excel(header=header_row) 后按列名匹配，当表头行有空列（NaN/Unnamed）时匹配失败
+    - 新版改为：先找表头行下标，再按列下标（int）而非列名访问数据，彻底绕开 NaN 列名问题
+    - 表头识别改为"至少命中2个关键词"，避免标题行误判
+    - 型号列候选扩充"产品名称/品名"，兼容厂商合同格式
+    """
+    df_raw = pd.read_excel(file_path, header=None)
+
+    # 1. 找表头行（前15行里至少命中2个关键词）
+    HEADER_KW = ["型号", "单价", "price", "货期", "含税", "model",
+                 "part no", "交期", "数量", "产品名称", "品名"]
+    header_row_idx = 0
+    for i in range(min(15, len(df_raw))):
+        row_str = " ".join(str(v).lower() for v in df_raw.iloc[i].values)
+        if sum(1 for k in HEADER_KW if k in row_str) >= 2:
+            header_row_idx = i
+            break
+
+    # 2. 把表头行的原始值（包括nan）存成列表，用下标访问
+    headers_raw = [str(v).strip() for v in df_raw.iloc[header_row_idx].values]
+    data_df = df_raw.iloc[header_row_idx + 1:].reset_index(drop=True)
+
+    def find_col_idx(candidates):
+        """按列下标返回，跳过nan列名，彻底避免Unnamed:N的陷阱"""
         for name in candidates:
-            for col in df.columns:
-                if name.lower() in col.lower():
-                    return col
+            for ci, col in enumerate(headers_raw):
+                if col != "nan" and name.lower() in col.lower():
+                    return ci
         return None
 
-    model_col    = find_col(["型号", "model", "part", "订货号"])
-    price_col    = find_col(["含税单价", "单价", "price"])
-    delivery_col = find_col(["货期", "delivery", "交期"])
+    model_ci    = find_col_idx(["型号", "model", "part", "订货号", "料号", "产品名称", "品名"])
+    price_ci    = find_col_idx(["含税单价", "含税价", "单价", "price"])
+    delivery_ci = find_col_idx(["货期", "delivery", "交期", "lead time", "货期及付款"])
 
+    if model_ci is None:
+        raise ValueError(f"无法识别型号列，请确认厂商报价单格式。表头识别结果：{headers_raw}")
+
+    SKIP = {"nan", "合计", "小计", "总计", "序号", ""}
     results = {}
-    for _, row in df.iterrows():
-        model = str(row[model_col]).strip() if model_col else ""
-        if not model or model in ["nan", "合计", "小计", ""]:
+    for _, row in data_df.iterrows():
+        row_vals = list(row.values)
+
+        model = str(row_vals[model_ci]).strip() if model_ci < len(row_vals) else ""
+        if not model or model.lower() in SKIP:
             continue
-        try:
-            price = float(str(row[price_col]).replace(",","").replace("¥","").replace("￥","")) if price_col else 0.0
-        except Exception:
-            price = 0.0
-        delivery = str(row[delivery_col]).strip() if delivery_col and str(row.get(delivery_col,"")) != "nan" else ""
+
+        price = 0.0
+        if price_ci is not None and price_ci < len(row_vals):
+            p_raw = str(row_vals[price_ci]).replace(",","").replace("¥","").replace("￥","").strip()
+            try:
+                price = float(p_raw)
+            except Exception:
+                price = 0.0
+
+        delivery = ""
+        if delivery_ci is not None and delivery_ci < len(row_vals):
+            d_raw = str(row_vals[delivery_ci]).strip()
+            if d_raw.lower() not in ("nan", ""):
+                delivery = d_raw
+
         results[model] = {"purchase_price": price, "delivery_weeks": delivery}
     return results
 
