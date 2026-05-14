@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-_model = genai.GenerativeModel("gemini-2.0-flash")
+_model = genai.GenerativeModel("gemini-1.5-flash")
 
 CONFIDENCE_THRESHOLD = 0.85
 
