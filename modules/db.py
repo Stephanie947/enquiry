@@ -248,3 +248,51 @@ def delete_client(client_id):
     c.execute("DELETE FROM clients WHERE id=?", (client_id,))
     conn.commit()
     conn.close()
+
+
+def get_order_items(order_id):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT * FROM order_items WHERE order_id=?", (order_id,))
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+    return rows
+
+
+def update_order(order_id, contract_no, client_name, total_amount, status, notes):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+        UPDATE orders SET contract_no=?, client_name=?, total_amount=?,
+        status=?, notes=?, updated_at=datetime('now','localtime') WHERE id=?
+    """, (contract_no, client_name, total_amount, status, notes, order_id))
+    conn.commit()
+    conn.close()
+
+
+def delete_order(order_id):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("DELETE FROM order_items WHERE order_id=?", (order_id,))
+    c.execute("DELETE FROM orders WHERE id=?", (order_id,))
+    conn.commit()
+    conn.close()
+
+
+def update_client(client_id, name, address, bank, account, tax_no, contact, phone):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+        UPDATE clients SET name=?, address=?, bank=?, account=?, tax_no=?, contact=?, phone=?
+        WHERE id=?
+    """, (name, address, bank, account, tax_no, contact, phone, client_id))
+    conn.commit()
+    conn.close()
+
+
+def delete_client(client_id):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("DELETE FROM clients WHERE id=?", (client_id,))
+    conn.commit()
+    conn.close()
