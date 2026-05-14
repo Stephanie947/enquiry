@@ -2,6 +2,7 @@ import google.generativeai as genai
 import pandas as pd
 import json
 import re
+import pdfplumber
 import os
 import PIL.Image
 import io
@@ -192,3 +193,108 @@ def apply_markup(items: list[dict], markup_rate: float = 1.30) -> list[dict]:
             item["sale_price"]  = 0.0
             item["total_price"] = 0.0
     return items
+
+def parse_pdf(file_path: str, mode: str = "inquiry") -> list[dict]:
+    """
+    解析PDF文件，支持两种模式：
+    mode="inquiry"  → 解析客户询价单，提取型号+数量
+    mode="quote"    → 解析上游报价单，提取型号+含税单价+货期
+    """
+    rows = []
+    with pdfplumber.open(file_path) as pdf:
+        for page in pdf.pages:
+            tables = page.extract_tables()
+            for table in tables:
+                for row in table:
+                    # 清洗每个单元格
+                    cleaned = [str(c).strip() if c else "" for c in row]
+                    if any(cleaned):
+                        rows.append(cleaned)
+
+    if not rows:
+        return []
+
+    # 找表头行
+    header_idx = 0
+    for i, row in enumerate(rows):
+        row_str = " ".join(row).lower()
+        if any(k in row_str for k in ["型号", "model", "数量", "单价", "货期"]):
+            header_idx = i
+            break
+
+    headers = rows[header_idx]
+    data_rows = rows[header_idx + 1:]
+
+    def find_col(candidates):
+        for name in candidates:
+            for i, h in enumerate(headers):
+                if name.lower() in h.lower():
+                    return i
+        return None
+
+    if mode == "inquiry":
+        # 询价单：提取型号+数量
+        model_col = find_col(["型号", "model", "part"])
+        qty_col   = find_col(["数量", "qty", "quantity"])
+        desc_col  = find_col(["描述", "description", "名称"])
+        unit_col  = find_col(["单位", "unit"])
+
+        items = []
+        for row in data_rows:
+            if len(row) <= max(filter(None, [model_col, qty_col]), default=0):
+                continue
+            model = row[model_col].strip() if model_col is not None else ""
+            if not model or model in ["合计", "小计", "总计", ""]:
+                continue
+            try:
+                qty = int(float(row[qty_col].replace(",", ""))) if qty_col is not None else 0
+            except Exception:
+                qty = 0
+            if qty == 0:
+                continue
+            items.append({
+                "model_full":     model,
+                "model_short":    "",
+                "description":    row[desc_col].strip() if desc_col is not None else "",
+                "qty":            qty,
+                "unit":           row[unit_col].strip() if unit_col is not None else "个",
+                "brand":          "BALLUFF",
+                "purchase_price": 0.0,
+                "sale_price":     0.0,
+                "total_price":    0.0,
+                "delivery_weeks": "",
+                "confidence":     1.0,
+                "source":         "pdf",
+            })
+        return items
+
+    elif mode == "quote":
+        # 上游报价单：提取型号+含税单价+货期
+        model_col    = find_col(["型号", "model", "part"])
+        price_col    = find_col(["含税单价", "单价", "price", "unit price"])
+        delivery_col = find_col(["货期", "delivery", "lead time", "交期"])
+        qty_col      = find_col(["数量", "qty"])
+
+        results = {}
+        for row in data_rows:
+            if not row:
+                continue
+            model = row[model_col].strip() if model_col is not None and model_col < len(row) else ""
+            if not model or model in ["合计", "小计", ""]:
+                continue
+            try:
+                price = float(row[price_col].replace(",", "").replace("¥", "").replace("￥", "")) if price_col is not None and price_col < len(row) else 0.0
+            except Exception:
+                price = 0.0
+            delivery = row[delivery_col].strip() if delivery_col is not None and delivery_col < len(row) else ""
+            try:
+                qty = int(float(row[qty_col])) if qty_col is not None and qty_col < len(row) else 0
+            except Exception:
+                qty = 0
+
+            results[model] = {
+                "purchase_price":  price,
+                "delivery_weeks":  delivery,
+                "qty":             qty,
+            }
+        return results  # 返回字典，key是型号
