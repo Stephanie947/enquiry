@@ -226,16 +226,23 @@ if page == "报价全流程":
     client_name  = col1.text_input("客户名称", placeholder="如：上海科致电气自动化股份有限公司")
     markup_rate  = col2.number_input("默认加价率", min_value=1.0, max_value=3.0, value=1.30, step=0.05)
 
-    imported_prices  = st.session_state.get("imported_prices", {})
-    imported_markups = st.session_state.get("imported_markups", {})
-
-    # 自动从quote_data填入进价
-    if quote_data and not imported_prices:
-        for item in items:
-            mk = item.get("model_short") or item.get("model_full","")
+    # ── 进价填入：从 quote_data 匹配并注入 session_state ──────────────
+    # 修复说明：
+    # Bug A - 旧版 imported_prices 是本地变量，改完没写回 session_state，下次渲染丢失
+    # Bug B - Streamlit 的 number_input key 一旦存在就忽略 value= 参数，
+    #         必须在渲染前直接写 st.session_state[key] 才能强制刷新值
+    #
+    # 解决方案：上传厂商报价后打一个标记 "prices_injected"，
+    # 只要标记存在就把价格写入 widget key，每次渲染都能正确显示
+    if quote_data and st.session_state.get("quote_data_version") != id(quote_data):
+        # 新的 quote_data 刚上传，把进价/货期直接写进 widget 的 session_state key
+        for idx, item in enumerate(items):
+            mk = item.get("model_short") or item.get("model_full", "")
             if mk in quote_data:
-                imported_prices[mk]  = quote_data[mk]
-                imported_markups[mk] = markup_rate
+                st.session_state[f"price_{idx}"]    = float(quote_data[mk].get("purchase_price", 0.0))
+                st.session_state[f"delivery_{idx}"] = quote_data[mk].get("delivery_weeks", "")
+                st.session_state[f"rate_{idx}"]     = float(markup_rate)
+        st.session_state["quote_data_version"] = id(quote_data)
 
     cols_h = st.columns([3,2,2,1])
     cols_h[0].markdown("**型号**"); cols_h[1].markdown("**含税进价**")
@@ -245,15 +252,13 @@ if page == "报价全流程":
         mk = item.get("model_short") or item.get("model_full","")
         cm1, cm2, cm3, cm4 = st.columns([3,2,2,1])
         cm1.text(mk[:28])
-        default_p = imported_prices.get(mk, {}).get("purchase_price", 0.0)
-        default_d = imported_prices.get(mk, {}).get("delivery_weeks", "")
-        default_m = imported_markups.get(mk, markup_rate)
 
-        price    = cm2.number_input(f"p{i}", min_value=0.0, step=1.0, value=float(default_p),
+        # value= 只在 key 不存在时生效；key 已被上面注入，所以这里直接用 key 驱动
+        price    = cm2.number_input(f"p{i}", min_value=0.0, step=1.0, value=0.0,
                                     key=f"price_{i}", label_visibility="collapsed")
-        delivery = cm3.text_input(f"d{i}", value=default_d, key=f"delivery_{i}",
+        delivery = cm3.text_input(f"d{i}", value="", key=f"delivery_{i}",
                                    label_visibility="collapsed", placeholder="如：现货/4周")
-        sku_rate = cm4.number_input(f"r{i}", min_value=1.0, max_value=3.0, value=float(default_m),
+        sku_rate = cm4.number_input(f"r{i}", min_value=1.0, max_value=3.0, value=markup_rate,
                                     step=0.05, key=f"rate_{i}", label_visibility="collapsed")
         items[i].update({"purchase_price": price, "delivery_weeks": delivery, "sku_markup_rate": sku_rate})
 
